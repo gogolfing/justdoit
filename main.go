@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"path/filepath"
 	"regexp"
@@ -34,6 +36,7 @@ func main() {
 	flagExclude := flag.String("exclude", "(.git|vendor)$", "Regex of paths to exclude")
 	flagInclude := flag.String("include", `(.+\.go|.+\.c)$`, "Regex of files to include")
 	flagBuild := flag.String("build", "go install -v", "Command to Build/Compile program")
+	flagSignal := flag.Int("signal", 0, "Signal to send to already running process. Non-positive means use os.Process.Kill")
 	flagRun := flag.String("run", "", "Command to run your application")
 
 	flag.Parse()
@@ -82,10 +85,10 @@ func main() {
 		notif <- struct{}{}
 	}()
 
-	build(*flagBuild, *flagRun, notif)
+	build(*flagBuild, *flagRun, notif, *flagSignal)
 }
 
-func build(buildCmd, executeCms string, event <-chan struct{}) {
+func build(buildCmd, executeCms string, event <-chan struct{}, signal int) {
 
 	buildArgs := strings.Split(buildCmd, " ")
 	executeArgs := strings.Split(executeCms, " ")
@@ -93,15 +96,15 @@ func build(buildCmd, executeCms string, event <-chan struct{}) {
 	for range event {
 		log.Notice("Running build command")
 		if !execute(buildArgs, false) {
-			kill(true)
+			kill(true, signal)
 			continue
 		}
 
-		go run(executeArgs)
+		go run(executeArgs, signal)
 	}
 }
 
-func kill(unlock bool) {
+func kill(unlock bool, signal int) {
 	lock.Lock()
 
 	if running {
@@ -109,11 +112,17 @@ func kill(unlock bool) {
 		// process can be nil
 		if proc != nil && proc.Process != nil {
 
-			log.Notice("Killing Process")
+			log.Notice("Stopping Process")
 
-			err := proc.Process.Kill()
+			var err error
+			if signal > 0 {
+				err = proc.Process.Signal(syscall.Signal(signal))
+			} else {
+				err = proc.Process.Kill()
+			}
+
 			if err != nil {
-				log.WithFields(log.F("error", err)).Error("could not kill process")
+				log.WithFields(log.F("error", err)).Error("could not stop process")
 			}
 		}
 
@@ -125,9 +134,9 @@ func kill(unlock bool) {
 	}
 }
 
-func run(args []string) {
+func run(args []string, signal int) {
 
-	kill(false)
+	kill(false, signal)
 	execute(args, true)
 }
 
@@ -187,35 +196,27 @@ func watch(notif chan<- struct{}, watch string, include, exclude *regexp.Regexp)
 		log.WithFields(log.F("error", err)).Fatal("could not walk watch path")
 	}
 
-	// evt := make(chan struct{})
-
-	// go func() {
-	// 	for {
-	// 		<-evt
-
-	// 	SELECT:
-	// 		select {
-	// 		case <-time.After(700 * time.Millisecond):
-	// 			notif <- struct{}{}
-	// 		case <-evt:
-	// 			goto SELECT
-	// 		}
-	// 	}
-	// }()
-
 	go func() {
 		for {
 			select {
 			case event := <-watcher.Events:
 
-				if event.Op&fsnotify.Remove == fsnotify.Remove || event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
+				go func(ct <-chan time.Time) {
+					for {
+						select {
+						case <-ct:
+							return
+						case <-watcher.Events:
+						}
+					}
+				}(time.After(time.Second))
 
+				if event.Op&fsnotify.Write == fsnotify.Write {
 					if include != nil && !include.MatchString(event.Name) {
 						continue
 					}
 
 					notif <- struct{}{}
-					// evt <- struct{}{}
 				}
 
 			case err := <-watcher.Errors:
